@@ -31,6 +31,9 @@ class MqttService {
       StreamController<MqttConnectionState>.broadcast();
   Stream<MqttConnectionState> get connectionStream => _connectionController.stream;
 
+  final StreamController<AlertRecord> _emergencyController = StreamController<AlertRecord>.broadcast();
+  Stream<AlertRecord> get emergencyStream => _emergencyController.stream;
+
   MqttConnectionState get connectionState => _client?.connectionStatus?.state ?? MqttConnectionState.disconnected;
   AlertRepository get alertRepository => _alerts;
 
@@ -88,7 +91,8 @@ class MqttService {
       at: DateTime.now(),
     );
     _alerts.add(record);
-    _notifications.showAlert(title: 'Help Alert', body: payload);
+    _emergencyController.add(record);
+    _notifications.showEmergencyAlert(body: payload);
   }
 
   void _handleSensor(String payload) {
@@ -123,7 +127,14 @@ class MqttService {
           at: now,
         ));
       }
-      _notifications.showAlert(title: 'Sensor Alert', body: message);
+      _notifications.showEmergencyAlert(body: message);
+      final recordForStream = AlertRecord(
+        id: '${now.millisecondsSinceEpoch}_sensor',
+        type: data.temp >= tempThreshold ? 'temp' : 'hum',
+        message: message,
+        at: now,
+      );
+      _emergencyController.add(recordForStream);
     } catch (_) {
       _sensorController.add(null);
     }
@@ -139,6 +150,7 @@ class MqttService {
     _sensorController.close();
     _helpController.close();
     _connectionController.close();
+    _emergencyController.close();
     disconnect();
   }
 }

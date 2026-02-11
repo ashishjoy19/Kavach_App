@@ -32,6 +32,11 @@ android {
         targetCompatibility JavaVersion.VERSION_1_8
     }
 
+    // Suppress "Some input files use or override a deprecated API" notes from dependencies
+    tasks.withType(JavaCompile).configureEach {
+        options.compilerArgs << "-Xlint:-deprecation"
+    }
+
     kotlinOptions {
         jvmTarget = '1.8'
     }

@@ -1,6 +1,6 @@
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
-/// Shows local notifications for help and sensor-threshold alerts.
+/// Shows local notifications for emergency alerts.
 class NotificationService {
   static final NotificationService _instance = NotificationService._();
   factory NotificationService() => _instance;
@@ -17,36 +17,35 @@ class NotificationService {
       initSettings,
       onDidReceiveNotificationResponse: _onSelect,
     );
-    const androidDetails = AndroidNotificationDetails(
-      'kavach_alerts',
-      'Kavach Alerts',
-      channelDescription: 'Help and sensor threshold alerts',
-      importance: Importance.high,
-      priority: Priority.high,
-    );
     await _plugin
         .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
         ?.createNotificationChannel(const AndroidNotificationChannel(
-          'kavach_alerts',
-          'Kavach Alerts',
-          importance: Importance.high,
+          'kavach_emergency',
+          'Emergency Alerts',
+          description: 'High priority emergency alerts with sound and vibration',
+          importance: Importance.max,
+          playSound: true,
+          enableVibration: true,
         ));
   }
 
   void _onSelect(NotificationResponse response) {
-    // Could navigate to alert detail if needed
+    // Tapping notification opens app (dashboard already open if in app)
   }
 
-  Future<void> showAlert({required String title, required String body}) async {
+  /// Emergency alert: title "🚨 Emergency Alert", high priority, sound + vibration.
+  Future<void> showEmergencyAlert({required String body}) async {
     _id = (_id % 0x7FFFFFFF) + 1;
     const android = AndroidNotificationDetails(
-      'kavach_alerts',
-      'Kavach Alerts',
-      channelDescription: 'Help and sensor threshold alerts',
-      importance: Importance.high,
-      priority: Priority.high,
+      'kavach_emergency',
+      'Emergency Alerts',
+      channelDescription: 'High priority emergency alerts',
+      importance: Importance.max,
+      priority: Priority.max,
+      playSound: true,
+      enableVibration: true,
     );
     const details = NotificationDetails(android: android);
-    await _plugin.show(_id, title, body, details);
+    await _plugin.show(_id, '🚨 Emergency Alert', body, details);
   }
 }

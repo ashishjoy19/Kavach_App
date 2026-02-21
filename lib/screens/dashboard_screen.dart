@@ -7,8 +7,10 @@ import 'package:vibration/vibration.dart';
 
 import '../models/alert_record.dart';
 import '../models/sensor_data.dart';
+import '../services/broker_config_service.dart';
 import '../services/mqtt_service.dart';
 import 'alert_history_screen.dart';
+import 'connection_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
   final MqttService mqttService;
@@ -19,7 +21,7 @@ class DashboardScreen extends StatefulWidget {
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> with TickerProviderStateMixin {
+class _DashboardScreenState extends State<DashboardScreen> with TickerProviderStateMixin, WidgetsBindingObserver {
   SensorData? _sensor;
   DateTime? _sensorLastUpdated;
   AlertRecord? _activeAlert;
@@ -28,6 +30,8 @@ class _DashboardScreenState extends State<DashboardScreen> with TickerProviderSt
   StreamSubscription<AlertRecord>? _emergencySub;
   StreamSubscription<SensorData?>? _sensorSub;
   StreamSubscription<MqttConnectionState>? _connectionSub;
+  Timer? _deviceStatusTimer;
+  Timer? _pingTimer;
 
   late AnimationController _pulseController;
   late AnimationController _flashController;
@@ -41,6 +45,16 @@ class _DashboardScreenState extends State<DashboardScreen> with TickerProviderSt
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _deviceStatusTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted) setState(() {});
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      widget.mqttService.sendPing();
+    });
+    _pingTimer = Timer.periodic(const Duration(seconds: 60), (_) {
+      widget.mqttService.sendPing();
+    });
     _pulseController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 800),
@@ -85,12 +99,37 @@ class _DashboardScreenState extends State<DashboardScreen> with TickerProviderSt
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _deviceStatusTimer?.cancel();
+    _pingTimer?.cancel();
     _pulseController.dispose();
     _flashController.dispose();
     _emergencySub?.cancel();
     _sensorSub?.cancel();
     _connectionSub?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) return;
+    _reconnectIfNeeded();
+    widget.mqttService.sendPing();
+  }
+
+  Future<void> _reconnectIfNeeded() async {
+    if (widget.mqttService.connectionState == MqttConnectionState.connected) return;
+    final config = await BrokerConfigService.load();
+    if (config == null) return;
+    try {
+      await widget.mqttService.connect(
+        host: config.host,
+        port: config.port,
+        username: config.username.isEmpty ? 'kavach' : config.username,
+        password: config.password.isEmpty ? 'kavach' : config.password,
+      );
+      if (mounted) setState(() {});
+    } catch (_) {}
   }
 
   void _acknowledgeAlert() {
@@ -106,7 +145,11 @@ class _DashboardScreenState extends State<DashboardScreen> with TickerProviderSt
 
   Future<void> _disconnect() async {
     await widget.mqttService.disconnect();
-    if (mounted) Navigator.of(context).pop();
+    if (mounted) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => const ConnectionScreen(autoConnect: false)),
+      );
+    }
   }
 
   @override
@@ -134,9 +177,11 @@ class _DashboardScreenState extends State<DashboardScreen> with TickerProviderSt
             onSelected: (v) {
               if (v == 'disconnect') _disconnect();
               if (v == 'thresholds') _showThresholds(context);
+              if (v == 'tip') _showBackgroundTip(context);
             },
             itemBuilder: (_) => [
               const PopupMenuItem(value: 'thresholds', child: Text('Set thresholds')),
+              const PopupMenuItem(value: 'tip', child: Text('About background alerts')),
               const PopupMenuItem(value: 'disconnect', child: Text('Disconnect')),
             ],
           ),
@@ -145,6 +190,10 @@ class _DashboardScreenState extends State<DashboardScreen> with TickerProviderSt
       body: Column(
         children: [
           _ConnectionStatusBar(connected: connected, connecting: connecting),
+          _DeviceStatusBar(
+            online: widget.mqttService.isDeviceOnline,
+            onPing: widget.mqttService.sendPing,
+          ),
           Expanded(
             child: RefreshIndicator(
               onRefresh: _loadAlertHistory,
@@ -163,6 +212,10 @@ class _DashboardScreenState extends State<DashboardScreen> with TickerProviderSt
                     mqtt: widget.mqttService,
                     pulseController: _pulseController,
                   ),
+                  if (_sensor == null) ...[
+                    const SizedBox(height: 12),
+                    _SensorTip(),
+                  ],
                   const SizedBox(height: 20),
                   _AlertHistorySection(
                     records: _alertHistory,
@@ -172,6 +225,26 @@ class _DashboardScreenState extends State<DashboardScreen> with TickerProviderSt
                 ],
               ),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showBackgroundTip(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: _kCardDark,
+        title: const Text('Background alerts'),
+        content: const Text(
+          'To get alerts when the app is in the background or closed, keep the app open (minimized) when possible. '
+          'You can also disable battery optimization for Kavach in your device settings (Battery → App battery usage → Kavach → Unrestricted) so the connection is less likely to be stopped.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('OK'),
           ),
         ],
       ),
@@ -276,6 +349,56 @@ class _ConnectionStatusBar extends StatelessWidget {
   }
 }
 
+class _DeviceStatusBar extends StatelessWidget {
+  final bool online;
+  final VoidCallback? onPing;
+
+  const _DeviceStatusBar({required this.online, this.onPing});
+
+  static const _kSafeGreen = Color(0xFF22c55e);
+  static const _kRed = Color(0xFFef4444);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+      color: online ? _kSafeGreen.withOpacity(0.15) : _kRed.withOpacity(0.15),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            online ? Icons.sensors : Icons.sensors_off,
+            size: 18,
+            color: online ? _kSafeGreen : _kRed,
+          ),
+          const SizedBox(width: 8),
+          Text(
+            online ? 'Device (ESP32) online' : 'Device (ESP32) offline',
+            style: TextStyle(
+              fontWeight: FontWeight.w500,
+              fontSize: 13,
+              color: online ? _kSafeGreen : _kRed,
+            ),
+          ),
+          if (onPing != null) ...[
+            const SizedBox(width: 12),
+            IconButton(
+              icon: const Icon(Icons.refresh, size: 20),
+              onPressed: onPing,
+              tooltip: 'Send ping to device',
+              style: IconButton.styleFrom(
+                minimumSize: const Size(36, 36),
+                padding: EdgeInsets.zero,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
 class _EmergencySection extends StatelessWidget {
   final AlertRecord? activeAlert;
   final VoidCallback onAcknowledge;
@@ -347,6 +470,16 @@ class _ActiveEmergencyCard extends StatefulWidget {
 
 class _ActiveEmergencyCardState extends State<_ActiveEmergencyCard> {
   static const _kEmergencyRed = Color(0xFFef4444);
+  static const _kGasOrange = Color(0xFFe65c00);
+  static const _kIntrudePurple = Color(0xFF7c3aed);
+
+  bool get _isGasAlert => widget.record.type == 'gas';
+  bool get _isIntrudeAlert => widget.record.type == 'intrude';
+  Color get _themeColor => _isGasAlert
+      ? _kGasOrange
+      : _isIntrudeAlert
+          ? _kIntrudePurple
+          : _kEmergencyRed;
 
   @override
   Widget build(BuildContext context) {
@@ -358,17 +491,17 @@ class _ActiveEmergencyCardState extends State<_ActiveEmergencyCard> {
           width: double.infinity,
           margin: const EdgeInsets.only(bottom: 8),
           decoration: BoxDecoration(
-            color: _kEmergencyRed,
+            color: _themeColor,
             borderRadius: BorderRadius.circular(16),
             boxShadow: [
               BoxShadow(
-                color: _kEmergencyRed.withOpacity( 0.4),
+                color: _themeColor.withOpacity(0.4),
                 blurRadius: 12,
                 spreadRadius: 0,
               ),
             ],
             border: Border.all(
-              color: Colors.white.withOpacity( borderOpacity),
+              color: Colors.white.withOpacity(borderOpacity),
               width: 2,
             ),
           ),
@@ -377,18 +510,40 @@ class _ActiveEmergencyCardState extends State<_ActiveEmergencyCard> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                const Text(
-                  '🚨 EMERGENCY ALERT',
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 20,
-                    color: Colors.white,
-                    letterSpacing: 0.5,
-                  ),
+                Row(
+                  children: [
+                    Icon(
+                      _isGasAlert
+                          ? Icons.gas_meter
+                          : _isIntrudeAlert
+                              ? Icons.person_search
+                              : Icons.warning_amber_rounded,
+                      color: Colors.white,
+                      size: 26,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      _isGasAlert
+                          ? '⚠️ GAS LEAK'
+                          : _isIntrudeAlert
+                              ? '🚨 INTRUDER DETECTED'
+                              : '🚨 EMERGENCY ALERT',
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 20,
+                        color: Colors.white,
+                        letterSpacing: 0.5,
+                      ),
+                    ),
+                  ],
                 ),
                 const SizedBox(height: 12),
                 Text(
-                  widget.record.message,
+                  _isGasAlert
+                      ? 'Gas leakage detected in kitchen. Ventilate and avoid flames.'
+                      : _isIntrudeAlert
+                          ? 'Motion detected. Possible intruder.'
+                          : widget.record.message,
                   style: const TextStyle(
                     fontSize: 18,
                     fontWeight: FontWeight.w600,
@@ -396,12 +551,23 @@ class _ActiveEmergencyCardState extends State<_ActiveEmergencyCard> {
                     height: 1.3,
                   ),
                 ),
+                if (_isGasAlert && widget.record.message.contains('level:'))
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      widget.record.message,
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: Colors.white.withOpacity(0.9),
+                      ),
+                    ),
+                  ),
                 const SizedBox(height: 8),
                 Text(
                   _formatTime(widget.record.at),
                   style: TextStyle(
                     fontSize: 14,
-                    color: Colors.white.withOpacity( 0.9),
+                    color: Colors.white.withOpacity(0.9),
                   ),
                 ),
                 const SizedBox(height: 16),
@@ -411,7 +577,7 @@ class _ActiveEmergencyCardState extends State<_ActiveEmergencyCard> {
                     onPressed: widget.onAcknowledge,
                     style: FilledButton.styleFrom(
                       backgroundColor: Colors.white,
-                      foregroundColor: _kEmergencyRed,
+                      foregroundColor: _themeColor,
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(12),
                       ),
@@ -454,13 +620,16 @@ class _SensorSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Expanded(
-          child: _SensorCard(
-            icon: Icons.thermostat,
-            value: sensor?.temp ?? null,
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: _SensorCard(
+                icon: Icons.thermostat,
+                value: sensor?.temp ?? null,
             unit: '°C',
             label: 'Live Temperature',
             lastUpdated: lastUpdated,
@@ -481,6 +650,37 @@ class _SensorSection extends StatelessWidget {
           ),
         ),
       ],
+    ),
+      ],
+    );
+  }
+}
+
+class _SensorTip extends StatelessWidget {
+  const _SensorTip();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1e293b),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFF06b6d4).withOpacity(0.3)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.lightbulb_outline, size: 20, color: const Color(0xFF06b6d4)),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'No sensor data yet. If it works on the emulator but not here: connect this device to the same broker (e.g. your PC\'s Wi‑Fi IP like 192.168.1.x). Sensor data is published to that broker—the phone must use it too.',
+              style: TextStyle(fontSize: 12, color: Colors.white.withOpacity(0.85), height: 1.3),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
